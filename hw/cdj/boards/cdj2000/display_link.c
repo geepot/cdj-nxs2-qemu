@@ -3,6 +3,7 @@
 #include "cdj_getenv.h"
 #include "exec/cpu-common.h"
 #include "qemu/cutils.h"
+#include "qemu/timer.h"
 /*
  * MAIN's end of the display link: two twin blocks, 0xFF400000 receiving from
  * the display processor and 0xFF500000 sending to it. Each is a DMA engine at
@@ -71,7 +72,23 @@ typedef struct LinkPort {
     uint32_t q_len[LINK_QUEUE];
     uint32_t q_head, q_count;
     uint64_t q_dropped;
+    /* Wire pacing: when the last answer went into MAIN's buffer (virtual ns),
+     * and the timer that hands over the next one once its wire time is up. */
+    int64_t rx_last_ns;
+    QEMUTimer *rx_gap;
 } LinkPort;
+
+/* SPORT1 runs at 2.891 Mbit/s (TCLKDIV=16 at 98.304 MHz SCLK): a frame cannot
+ * land sooner after the one before than its own bits take on the wire.
+ * CDJ_LINK_RX_GAP_US=<us> replaces that with a fixed minimum gap. */
+#define LINK_WIRE_BPS   2891294
+static int64_t link_gap_us = -1;
+
+static int64_t link_wire_ns(uint32_t len)
+{
+    return link_gap_us >= 0 ? link_gap_us * 1000
+                            : (int64_t)len * 8 * NANOSECONDS_PER_SECOND / LINK_WIRE_BPS;
+}
 
 static LinkPort link_rx, link_tx;
 static bool link_log;
@@ -140,11 +157,24 @@ static void link_rx_pump(LinkPort *p)
 {
     if (p->q_count && (p->reg[DMA_CTRL / 4] & CTRL_START) && !p->units) {
         uint32_t h = p->q_head;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t due = p->rx_last_ns + link_wire_ns(p->q_len[h]);
+
+        if (now < due) {
+            timer_mod(p->rx_gap, due);
+            return;
+        }
+        p->rx_last_ns = now;
 
         p->q_head = (h + 1) % LINK_QUEUE;
         p->q_count--;
         link_deliver(p, p->q + h * LINK_QFRAME, p->q_len[h]);
     }
+}
+
+static void link_rx_gap_up(void *opaque)
+{
+    link_rx_pump(opaque);
 }
 
 void cdj2000_display_link_receive(const uint8_t *pkt, size_t len)
@@ -222,8 +252,8 @@ static const MemoryRegionOps link_ops = {
 
 static const VMStateDescription vmstate_link_port = {
     .name = "cdj2000-display-link",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(units, LinkPort),
         VMSTATE_UINT32_ARRAY(reg, LinkPort, LINK_WINDOW / 4),
@@ -231,6 +261,8 @@ static const VMStateDescription vmstate_link_port = {
         VMSTATE_UINT32_ARRAY(q_len, LinkPort, LINK_QUEUE),
         VMSTATE_UINT32(q_head, LinkPort),
         VMSTATE_UINT32(q_count, LinkPort),
+        VMSTATE_INT64(rx_last_ns, LinkPort),
+        VMSTATE_TIMER_PTR(rx_gap, LinkPort),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -240,6 +272,7 @@ static void link_port_init(LinkPort *p, MemoryRegion *sysmem, const char *name,
                            qemu_irq ser_irq)
 {
     p->addr_reg = addr_reg;
+    p->rx_gap = timer_new_ns(QEMU_CLOCK_VIRTUAL, link_rx_gap_up, p);
     p->len_reg = addr_reg + 8;
     p->irq = irq;
     p->ser_irq = ser_irq;
@@ -253,7 +286,12 @@ static void link_port_init(LinkPort *p, MemoryRegion *sysmem, const char *name,
 void cdj2000_display_link_init(MemoryRegion *sysmem, qemu_irq rx, qemu_irq tx,
                                qemu_irq tx_ser)
 {
+    const char *gap = getenv("CDJ_LINK_RX_GAP_US");
+
     link_log = getenv("CDJ_BF531_LINK_LOG");
+    if (gap) {
+        link_gap_us = strtoll(gap, NULL, 10);
+    }
     link_port_init(&link_rx, sysmem, "sh7763.display-rx", 0xFF400000,
                    0x1018, rx, NULL);
     link_port_init(&link_tx, sysmem, "sh7763.display-tx", 0xFF500000,
