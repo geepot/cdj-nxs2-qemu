@@ -41,6 +41,8 @@
 #define LINK_WINDOW     0x10000
 #define LINK_UNIT       16
 #define LINK_BUFFER     0x800
+#define LINK_QUEUE      64
+#define LINK_QFRAME     128     /* the Blackfin answers at most 128 bytes */
 
 #define DMA_CTRL        0x1028
 #define DMA_STATUS      0x1188
@@ -63,6 +65,12 @@ typedef struct LinkPort {
     qemu_irq ser_irq;
     unsigned units;
     uint32_t reg[LINK_WINDOW / 4];
+    /* re:spin: answers that land while the receive is not armed, or its last
+     * frame not yet retired, wait here in order instead of being dropped. */
+    uint8_t q[LINK_QUEUE * LINK_QFRAME];
+    uint32_t q_len[LINK_QUEUE];
+    uint32_t q_head, q_count;
+    uint64_t q_dropped;
 } LinkPort;
 
 static LinkPort link_rx, link_tx;
@@ -115,22 +123,47 @@ static void link_send(LinkPort *p)
     link_ser_update(p);
 }
 
-void cdj2000_display_link_receive(const uint8_t *pkt, size_t len)
+static void link_deliver(LinkPort *p, const uint8_t *pkt, size_t len)
 {
-    LinkPort *p = &link_rx;
     uint32_t room = link_len(p);
 
-    if (!(p->reg[DMA_CTRL / 4] & CTRL_START)) {
-        warn_report("display link: answer of %zu bytes dropped, receive DMA "
-                    "not armed", len);
-        return;
-    }
     link_dump("display to MAIN", pkt, len);
     cpu_physical_memory_write(A7ADDR(p->reg[p->addr_reg / 4]), pkt,
                               MIN(len, room));
     p->reg[DMA_CTRL / 4] &= ~CTRL_START;
     p->units = room / LINK_UNIT;
     link_update(p);
+}
+
+/* Hands the oldest waiting answer over once the receive is armed and idle. */
+static void link_rx_pump(LinkPort *p)
+{
+    if (p->q_count && (p->reg[DMA_CTRL / 4] & CTRL_START) && !p->units) {
+        uint32_t h = p->q_head;
+
+        p->q_head = (h + 1) % LINK_QUEUE;
+        p->q_count--;
+        link_deliver(p, p->q + h * LINK_QFRAME, p->q_len[h]);
+    }
+}
+
+void cdj2000_display_link_receive(const uint8_t *pkt, size_t len)
+{
+    LinkPort *p = &link_rx;
+    uint32_t t;
+
+    if (p->q_count == LINK_QUEUE) {
+        /* Fail loud: a dropped link frame is a broken run. */
+        if (!p->q_dropped++) {
+            error_report("display link: receive queue full, oldest answer dropped");
+        }
+        p->q_head = (p->q_head + 1) % LINK_QUEUE;
+        p->q_count--;
+    }
+    t = (p->q_head + p->q_count++) % LINK_QUEUE;
+    memcpy(p->q + t * LINK_QFRAME, pkt, MIN(len, LINK_QFRAME));
+    p->q_len[t] = MIN(len, LINK_QFRAME);
+    link_rx_pump(p);
 }
 
 static uint64_t link_read(void *opaque, hwaddr off, unsigned size)
@@ -152,6 +185,9 @@ static void link_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             p->units--;
         }
         link_update(p);
+        if (p == &link_rx) {
+            link_rx_pump(p);
+        }
         return;
     }
     p->reg[off / 4] = deposit32(old, shift, 8 * size, val);
@@ -160,6 +196,9 @@ static void link_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (p == &link_tx && !(old & CTRL_START) &&
             (p->reg[off / 4] & CTRL_START)) {
             link_send(p);
+        }
+        if (p == &link_rx) {
+            link_rx_pump(p);
         }
         break;
     case DMA_MASK / 4:
@@ -183,11 +222,15 @@ static const MemoryRegionOps link_ops = {
 
 static const VMStateDescription vmstate_link_port = {
     .name = "cdj2000-display-link",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(units, LinkPort),
         VMSTATE_UINT32_ARRAY(reg, LinkPort, LINK_WINDOW / 4),
+        VMSTATE_BUFFER(q, LinkPort),
+        VMSTATE_UINT32_ARRAY(q_len, LinkPort, LINK_QUEUE),
+        VMSTATE_UINT32(q_head, LinkPort),
+        VMSTATE_UINT32(q_count, LinkPort),
         VMSTATE_END_OF_LIST()
     }
 };

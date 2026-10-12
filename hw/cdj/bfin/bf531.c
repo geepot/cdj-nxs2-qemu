@@ -107,6 +107,13 @@ struct bf531 {
     uint8_t  sport1_rx[2048];
     size_t   sport1_rx_len;
     bool     sport1_rx_armed;
+    /* re:spin: packets that land while one is standing wait here in order
+     * (a free-running link sends without waiting for an answer). Lives after
+     * sport1_rx, so the snapshot's tail run carries it. */
+    uint8_t  sport1_q[16][2048];
+    uint16_t sport1_q_len[16];
+    unsigned sport1_q_head, sport1_q_count;
+    uint64_t sport1_q_dropped;
 };
 
 static void __attribute__((format(printf, 2, 3))) slog(bf531 *s, const char *fmt, ...)
@@ -403,6 +410,14 @@ static void sport1_rx_complete(bf531 *s, int ch)
     }
     s->sport1_rx_len = 0;
     s->sport1_rx_armed = false;
+    if (s->sport1_q_count) {
+        unsigned h = s->sport1_q_head;
+
+        memcpy(s->sport1_rx, s->sport1_q[h], s->sport1_q_len[h]);
+        s->sport1_rx_len = s->sport1_q_len[h];
+        s->sport1_q_head = (h + 1) % 16;
+        s->sport1_q_count--;
+    }
     s->mmr[SIC_IMASK / 4] |= 1u << (IRQ_PPI_DMA + ch);
     dma_unit_done(s, ch);
 }
@@ -642,10 +657,29 @@ void bf531_sport1_rx(bf531 *s, const uint8_t *data, size_t len)
     if (len > sizeof(s->sport1_rx)) {
         len = sizeof(s->sport1_rx);
     }
-    if (data) {
-        memcpy(s->sport1_rx, data, len);
+    if (!data) {
+        s->sport1_rx_len = 0;
+        s->sport1_q_count = 0;
+        return;
     }
-    s->sport1_rx_len = data ? len : 0;
+    if (s->sport1_rx_len) {
+        unsigned t;
+
+        if (s->sport1_q_count == 16) {
+            /* Fail loud: a dropped link packet is a broken run. */
+            if (!s->sport1_q_dropped++) {
+                fprintf(stderr, "bf531: SPORT1 RX queue full, oldest packet dropped\n");
+            }
+            s->sport1_q_head = (s->sport1_q_head + 1) % 16;
+            s->sport1_q_count--;
+        }
+        t = (s->sport1_q_head + s->sport1_q_count++) % 16;
+        memcpy(s->sport1_q[t], data, len);
+        s->sport1_q_len[t] = len;
+        return;
+    }
+    memcpy(s->sport1_rx, data, len);
+    s->sport1_rx_len = len;
     /* Lands as the chip's next event, not from the host's call, so the
      * interrupt it raises reaches the core inside bf531_run. */
     if (data && s->sport1_rx_armed) {
