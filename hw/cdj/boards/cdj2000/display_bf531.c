@@ -6,6 +6,11 @@
 #include "ui/surface.h"
 #include "cdj_gui_keys.h"
 #include "bfin/bf531.h"
+#include "bfin/bfin_gdb.h"
+#include "qemu/main-loop.h"
+#include "qemu/sockets.h"
+#include "qapi/error.h"
+#include "sysemu/runstate.h"
 /*
  * CDJ-2000/CDJ-2000NXS display processor: the ADSP-BF531 on the other end
  * of SPORT1, in its own window. The core itself is plain C with no QEMU
@@ -39,6 +44,11 @@ typedef struct CdjBf531 {
     uint64_t frames;
     GByteArray *snap;           /* the chip's image, only while saving or loading */
     Notifier exit;
+    /* CDJ_BF531_GDB: host-side debugger state, never migrated. */
+    int gdb_listen;             /* -1 when off */
+    int gdb_fd;                 /* -1 when no debugger is attached */
+    bool gdb_lost;              /* a send failed; dropped after the call */
+    bfin_gdb *gdb;
 } CdjBf531;
 
 static CdjBf531 cdj_bf531;
@@ -101,11 +111,213 @@ static const GraphicHwOps cdj_bf531_ops = {
     .gfx_update = cdj_bf531_update,
 };
 
+static void cdj_bf531_gdb_drop(CdjBf531 *s);
+
+/*
+ * Debugger (CDJ_BF531_GDB=<unix socket path | tcp port | host:port>).
+ *
+ * While gdb is attached and the target is halted the whole machine is
+ * stopped (vm_stop), so MAIN and the DSP freeze with the display processor.
+ * Continue is vm_start(): the tick below runs the chip and, at a breakpoint
+ * or watchpoint, reports the stop and stops the machine again. A single step
+ * runs in place on the main loop, with the machine stopped, because nothing
+ * but the chip's own cycle count advances the chip's peripherals.
+ */
+static void cdj_bf531_gdb_write(void *opaque, const uint8_t *buf, size_t len)
+{
+    CdjBf531 *s = opaque;
+
+    while (len && s->gdb_fd >= 0 && !s->gdb_lost) {
+        ssize_t n = send(s->gdb_fd, buf, len, 0);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            s->gdb_lost = true;
+            return;
+        }
+        buf += n;
+        len -= n;
+    }
+}
+
+static int cdj_bf531_gdb_peek(void *opaque, uint32_t addr, uint8_t *buf,
+                              size_t len)
+{
+    CdjBf531 *s = opaque;
+
+    return bf531_peek(s->chip, addr, buf, len);
+}
+
+static int cdj_bf531_gdb_poke(void *opaque, uint32_t addr, const uint8_t *buf,
+                              size_t len)
+{
+    CdjBf531 *s = opaque;
+
+    return bf531_poke(s->chip, addr, buf, len);
+}
+
+/* After the session saw bytes or the chip stopped: act on what it wants. */
+static void cdj_bf531_gdb_after(CdjBf531 *s)
+{
+    if (s->gdb_lost || bfin_gdb_detached(s->gdb)) {
+        cdj_bf531_gdb_drop(s);
+        return;
+    }
+    switch (bfin_gdb_run_request(s->gdb)) {
+    case BFIN_GDB_CONT:
+        if (bfin_gdb_interrupted(s->gdb)) {
+            bfin_gdb_stopped(s->gdb, BFIN_STOP_BUDGET);
+            if (runstate_is_running()) {
+                vm_stop(RUN_STATE_DEBUG);
+            }
+        } else if (!runstate_is_running()) {
+            vm_start();
+        }
+        break;
+    case BFIN_GDB_STEP: {
+        bfin_stop stop = bf531_stepi(s->chip);
+
+        if (stop == BFIN_STOP_UNDEF) {
+            error_report("cdj_bf531: unimplemented instruction 0x%" PRIx64
+                         " at 0x%08x", bfin_trap_insn(bf531_core(s->chip)),
+                         bfin_trap_pc(bf531_core(s->chip)));
+        }
+        bfin_gdb_stopped(s->gdb, stop);
+        break;
+    }
+    default:
+        break;
+    }
+    if (s->gdb_lost) {
+        cdj_bf531_gdb_drop(s);
+    }
+}
+
+static void cdj_bf531_gdb_read(void *opaque)
+{
+    CdjBf531 *s = opaque;
+    uint8_t buf[4096];
+    ssize_t n = recv(s->gdb_fd, buf, sizeof(buf), 0);
+
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+        return;
+    }
+    if (n <= 0) {
+        cdj_bf531_gdb_drop(s);
+        return;
+    }
+    bfin_gdb_feed(s->gdb, buf, n);
+    cdj_bf531_gdb_after(s);
+}
+
+/* Detach, kill or a dropped connection: no breakpoint outlives the debugger
+ * and the machine runs again. */
+static void cdj_bf531_gdb_drop(CdjBf531 *s)
+{
+    bfin_core *core = bf531_core(s->chip);
+
+    qemu_set_fd_handler(s->gdb_fd, NULL, NULL, NULL);
+    close(s->gdb_fd);
+    s->gdb_fd = -1;
+    s->gdb_lost = false;
+    bfin_break_clear(core);
+    bfin_watch_clear(core);
+    bfin_gdb_free(s->gdb);
+    s->gdb = NULL;
+    if (!runstate_is_running()) {
+        vm_start();
+    }
+}
+
+static void cdj_bf531_gdb_accept(void *opaque)
+{
+    CdjBf531 *s = opaque;
+    bfin_gdb_ops ops = {
+        .opaque = s,
+        .write = cdj_bf531_gdb_write,
+        .read_mem = cdj_bf531_gdb_peek,
+        .write_mem = cdj_bf531_gdb_poke,
+    };
+    int fd = qemu_accept(s->gdb_listen, NULL, NULL);
+
+    if (fd < 0) {
+        return;
+    }
+    if (s->gdb) {                       /* one debugger at a time */
+        close(fd);
+        return;
+    }
+    socket_set_nodelay(fd);             /* fails on a unix socket: harmless */
+    s->gdb_fd = fd;
+    s->gdb_lost = false;
+    s->gdb = bfin_gdb_new(bf531_core(s->chip), &ops);
+    qemu_set_fd_handler(fd, cdj_bf531_gdb_read, NULL, s);
+    if (runstate_is_running()) {
+        vm_stop(RUN_STATE_DEBUG);
+    }
+    info_report("cdj_bf531: debugger attached, machine stopped");
+}
+
+static void cdj_bf531_gdb_listen(CdjBf531 *s, const char *spec)
+{
+    Error *err = NULL;
+    g_autofree char *str = NULL;
+    SocketAddress *addr;
+
+    if (g_ascii_isdigit(spec[0]) && !strchr(spec, ':')) {
+        str = g_strdup_printf("127.0.0.1:%s", spec);
+    } else if (spec[0] == '/' || spec[0] == '.') {
+        str = g_strdup_printf("unix:%s", spec);
+    } else {
+        str = g_strdup(spec);
+    }
+    addr = socket_parse(str, &err);
+    if (addr) {
+        s->gdb_listen = socket_listen(addr, 1, &err);
+        qapi_free_SocketAddress(addr);
+    }
+    if (s->gdb_listen < 0) {
+        error_report_err(err);
+        return;
+    }
+    qemu_socket_set_nonblock(s->gdb_listen);
+    qemu_set_fd_handler(s->gdb_listen, cdj_bf531_gdb_accept, NULL, s);
+    info_report("cdj_bf531: gdb listening on %s", str);
+}
+
 static void cdj_bf531_tick(void *opaque)
 {
     CdjBf531 *s = opaque;
-    bfin_stop stop = bf531_run(s->chip, CDJ_BF531_QUANTUM);
+    bfin_stop stop;
 
+    /* Halted under the debugger but the machine was resumed from elsewhere
+     * (the monitor): the chip stays where it stopped. */
+    if (s->gdb && bfin_gdb_run_request(s->gdb) == BFIN_GDB_HALT) {
+        timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / cdj_bf531_tick_hz);
+        return;
+    }
+    stop = bf531_run(s->chip, CDJ_BF531_QUANTUM);
+    if (s->gdb && (stop == BFIN_STOP_BREAK || stop == BFIN_STOP_WATCH ||
+                   stop == BFIN_STOP_UNDEF)) {
+        if (stop == BFIN_STOP_UNDEF) {
+            error_report("cdj_bf531: unimplemented instruction 0x%" PRIx64
+                         " at 0x%08x", bfin_trap_insn(bf531_core(s->chip)),
+                         bfin_trap_pc(bf531_core(s->chip)));
+        }
+        /* The timer stays armed (the saved image must find it so); the
+         * stopped machine's virtual clock does not advance it. */
+        timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / cdj_bf531_tick_hz);
+        bfin_gdb_stopped(s->gdb, stop);
+        vm_stop(RUN_STATE_DEBUG);
+        if (s->gdb_lost) {
+            cdj_bf531_gdb_drop(s);
+        }
+        return;
+    }
     if (stop == BFIN_STOP_UNDEF) {
         error_report("cdj_bf531: unimplemented instruction 0x%" PRIx64
                      " at 0x%08x", bfin_trap_insn(bf531_core(s->chip)),
@@ -361,5 +573,10 @@ bool cdj2000_display_init(const Cdj2000Display *desc)
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, cdj_bf531_tick, s);
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     vmstate_register_any(NULL, &vmstate_cdj_bf531, s);
+    s->gdb_listen = -1;
+    s->gdb_fd = -1;
+    if (getenv("CDJ_BF531_GDB")) {
+        cdj_bf531_gdb_listen(s, getenv("CDJ_BF531_GDB"));
+    }
     return true;
 }
