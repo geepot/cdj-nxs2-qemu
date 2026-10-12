@@ -26,6 +26,9 @@ $(O)/byteops_test: tests/byteops_test.c $(OBJS) | $(O)
 $(O)/gdb_test: tests/gdb_test.c tests/gdb_prog.h $(OBJS) | $(O)
 	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
 
+$(O)/gdb_server: tests/gdb_server.c tests/gdb_prog.h $(OBJS) | $(O)
+	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
+
 check: $(O)/gdb_test $(O)/byteops_test
 	$(O)/gdb_test
 	$(O)/byteops_test
