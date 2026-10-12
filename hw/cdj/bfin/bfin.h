@@ -26,6 +26,14 @@ typedef struct bfin_bus {
     void     (*write)(void *opaque, uint32_t addr, uint32_t val, unsigned size);
 } bfin_bus;
 
+/* One tracepoint hit: the core cycle count and R0-R2 when the instruction at
+ * pc was about to run. */
+typedef struct bfin_trace_rec {
+    uint64_t cycles;
+    uint32_t pc, r0, r1, r2;
+    uint16_t id;
+} bfin_trace_rec;
+
 typedef enum bfin_stop {
     BFIN_STOP_BUDGET = 0,   /* ran the whole budget                          */
     BFIN_STOP_IDLE,         /* in IDLE with nothing to wake it               */
@@ -38,6 +46,8 @@ typedef enum bfin_stop {
 
 #define BFIN_MAX_BREAK 32
 #define BFIN_MAX_WATCH 16
+#define BFIN_MAX_TRACE 64
+#define BFIN_TRACE_RING 0x100000u   /* default ring size, records */
 
 /* Watchpoint kinds are a mask: an access watchpoint is READ | WRITE. */
 enum { BFIN_WATCH_WRITE = 1, BFIN_WATCH_READ = 2, BFIN_WATCH_ACCESS = 3 };
@@ -122,6 +132,20 @@ void bfin_watch_clear(bfin_core *c);
  * many further hits the same instruction or bundle made. */
 int      bfin_watch_hit(const bfin_core *c, uint32_t *addr, int *kind);
 unsigned bfin_watch_extra(const bfin_core *c);
+
+/* Tracepoints: like breakpoints for placement (exact, blocks split there),
+ * but a hit appends a bfin_trace_rec to a host ring and the core goes on.
+ * Adding one that is set updates its id. Return 0, or -1: table full
+ * (BFIN_MAX_TRACE) or odd address. A full ring never overwrites: further
+ * hits are counted in bfin_trace_lost() and not recorded.
+ * bfin_trace_drain copies up to max records out, oldest first, and returns
+ * how many. bfin_trace_ring() sets the capacity (call before the first
+ * bfin_trace_add; default BFIN_TRACE_RING); returns 0 or -1. */
+int      bfin_trace_add(bfin_core *c, uint32_t pc, uint16_t id);
+void     bfin_trace_clear(bfin_core *c);
+size_t   bfin_trace_drain(bfin_core *c, bfin_trace_rec *out, size_t max);
+uint64_t bfin_trace_lost(const bfin_core *c);
+int      bfin_trace_ring(bfin_core *c, uint32_t nrec);
 
 /* Executes exactly one instruction or bundle, then returns BFIN_STOP_STEP
  * (or WATCH, UNDEF). A pending event is taken instead if one is ready: the

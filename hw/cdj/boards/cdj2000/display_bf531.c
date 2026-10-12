@@ -49,6 +49,12 @@ typedef struct CdjBf531 {
     int gdb_fd;                 /* -1 when no debugger is attached */
     bool gdb_lost;              /* a send failed; dropped after the call */
     bfin_gdb *gdb;
+    /* CDJ_BF531_TRACE: tracepoint records, drained to a file every tick. */
+    FILE *trace_fp;
+    unsigned trace_n;           /* points */
+    char **trace_name;
+    uint64_t *trace_count;
+    uint64_t trace_total, trace_lost;
 } CdjBf531;
 
 static CdjBf531 cdj_bf531;
@@ -287,6 +293,140 @@ static void cdj_bf531_gdb_listen(CdjBf531 *s, const char *spec)
     info_report("cdj_bf531: gdb listening on %s", str);
 }
 
+/*
+ * Trace file (little endian): "BFTRACE1", u32 cclk_hz, u32 npoints, then per
+ * point u16 length + name; then 32-byte records until EOF:
+ *   u64 cycles, u32 pc, u32 r0, u32 r1, u32 r2, u16 id, u16 kind, u32 0.
+ * kind 0 = a hit; kind 1 = LOST: r0|r1<<32 = hits dropped so far, cycles =
+ * when the glue noticed (everything between the previous record and the first
+ * hit after this one may be incomplete).
+ */
+typedef struct QEMU_PACKED {
+    uint64_t cycles;
+    uint32_t pc, r0, r1, r2;
+    uint16_t id, kind;
+    uint32_t pad;
+} CdjTraceRec;
+
+static void cdj_bf531_trace_drain(CdjBf531 *s)
+{
+    bfin_core *core = bf531_core(s->chip);
+    bfin_trace_rec buf[1024];
+    size_t n;
+
+    if (!s->trace_fp) {
+        return;
+    }
+    while ((n = bfin_trace_drain(core, buf, ARRAY_SIZE(buf))) != 0) {
+        for (size_t i = 0; i < n; i++) {
+            CdjTraceRec r = { buf[i].cycles, buf[i].pc, buf[i].r0, buf[i].r1,
+                              buf[i].r2, buf[i].id, 0, 0 };
+
+            fwrite(&r, sizeof(r), 1, s->trace_fp);
+            if (buf[i].id < s->trace_n) {
+                s->trace_count[buf[i].id]++;
+            }
+        }
+        s->trace_total += n;
+    }
+    if (bfin_trace_lost(core) != s->trace_lost) {
+        uint64_t lost = bfin_trace_lost(core);
+        CdjTraceRec r = { bfin_cycles(core), 0, (uint32_t)lost,
+                          (uint32_t)(lost >> 32), 0, 0, 1, 0 };
+
+        if (!s->trace_lost) {
+            error_report("cdj_bf531: TRACE RING OVERFLOW, hits were dropped "
+                         "(the trace file has a LOST record)");
+        }
+        s->trace_lost = lost;
+        fwrite(&r, sizeof(r), 1, s->trace_fp);
+    }
+    fflush(s->trace_fp);
+}
+
+/* CDJ_BF531_TRACE=<points file>:<out file>; points are "<hex addr> <name>"
+ * per line, the id being the line index. */
+static void cdj_bf531_trace_open(CdjBf531 *s, const char *spec)
+{
+    g_autofree char *spec_c = g_strdup(spec);
+    char *out = strchr(spec_c, ':');
+    g_autofree char *text = NULL;
+    g_auto(GStrv) lines = NULL;
+    bfin_core *core = bf531_core(s->chip);
+    uint32_t hz = BF531_CCLK_HZ, n = 0;
+    uint8_t hdr[16] = "BFTRACE1";
+
+    if (!out) {
+        error_report("cdj_bf531: CDJ_BF531_TRACE wants <points>:<out>");
+        return;
+    }
+    *out++ = 0;
+    if (!g_file_get_contents(spec_c, &text, NULL, NULL)) {
+        error_report("cdj_bf531: cannot read trace points %s", spec_c);
+        return;
+    }
+    lines = g_strsplit(text, "\n", -1);
+    for (char **l = lines; *l; l++) {
+        if (**l) {
+            n++;
+        }
+    }
+    if (n > BFIN_MAX_TRACE) {
+        error_report("cdj_bf531: %u trace points, at most %d", n,
+                     BFIN_MAX_TRACE);
+        return;
+    }
+    s->trace_fp = fopen(out, "wb");
+    if (!s->trace_fp) {
+        error_report("cdj_bf531: cannot write %s", out);
+        return;
+    }
+    s->trace_name = g_new0(char *, n + 1);
+    s->trace_count = g_new0(uint64_t, n + 1);
+    memcpy(hdr + 8, &hz, 4);            /* little endian host assumed */
+    memcpy(hdr + 12, &n, 4);
+    fwrite(hdr, sizeof(hdr), 1, s->trace_fp);
+    for (char **l = lines; *l; l++) {
+        char *end;
+        uint32_t addr;
+        uint16_t len;
+
+        if (!**l) {
+            continue;
+        }
+        addr = strtoul(*l, &end, 16);
+        while (*end == ' ' || *end == '\t') {
+            end++;
+        }
+        s->trace_name[s->trace_n] = g_strdup(*end ? end : "?");
+        len = strlen(s->trace_name[s->trace_n]);
+        fwrite(&len, 2, 1, s->trace_fp);
+        fwrite(s->trace_name[s->trace_n], len, 1, s->trace_fp);
+        if (bfin_trace_add(core, addr, s->trace_n) < 0) {
+            error_report("cdj_bf531: cannot trace 0x%x (%s)", addr, end);
+        }
+        s->trace_n++;
+    }
+    fflush(s->trace_fp);
+    info_report("cdj_bf531: tracing %u points to %s", n, out);
+}
+
+static void cdj_bf531_trace_report(CdjBf531 *s)
+{
+    if (!s->trace_fp) {
+        return;
+    }
+    cdj_bf531_trace_drain(s);
+    for (unsigned i = 0; i < s->trace_n; i++) {
+        info_report("cdj_bf531: trace %-40s %" PRIu64, s->trace_name[i],
+                    s->trace_count[i]);
+    }
+    info_report("cdj_bf531: trace %" PRIu64 " records, %" PRIu64 " LOST",
+                s->trace_total, s->trace_lost);
+    fclose(s->trace_fp);
+    s->trace_fp = NULL;
+}
+
 static void cdj_bf531_tick(void *opaque)
 {
     CdjBf531 *s = opaque;
@@ -300,6 +440,7 @@ static void cdj_bf531_tick(void *opaque)
         return;
     }
     stop = bf531_run(s->chip, CDJ_BF531_QUANTUM);
+    cdj_bf531_trace_drain(s);
     if (s->gdb && (stop == BFIN_STOP_BREAK || stop == BFIN_STOP_WATCH ||
                    stop == BFIN_STOP_UNDEF)) {
         if (stop == BFIN_STOP_UNDEF) {
@@ -339,6 +480,7 @@ static void cdj_bf531_report(Notifier *n, void *opaque)
     const char *dir = getenv("CDJ_BF531_DUMP");
 
     info_report("cdj_bf531: %" PRIu64 " PPI frames rendered", s->frames);
+    cdj_bf531_trace_report(s);
     /* CDJ_BF531_DUMP=<dir>: the GUI's memory at exit, for offline decoding. */
     if (dir && s->chip) {
         uint32_t size;
@@ -577,6 +719,9 @@ bool cdj2000_display_init(const Cdj2000Display *desc)
     s->gdb_fd = -1;
     if (getenv("CDJ_BF531_GDB")) {
         cdj_bf531_gdb_listen(s, getenv("CDJ_BF531_GDB"));
+    }
+    if (getenv("CDJ_BF531_TRACE")) {
+        cdj_bf531_trace_open(s, getenv("CDJ_BF531_TRACE"));
     }
     return true;
 }

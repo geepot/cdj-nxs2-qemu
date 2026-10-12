@@ -46,6 +46,7 @@ bfin_core *bfin_new(const bfin_bus *bus)
 void bfin_free(bfin_core *c)
 {
     free(c->blocks);
+    free(c->tring);
     free(c->code_lines);
     free(c);
 }
@@ -537,7 +538,7 @@ static inline const bfin_block *next_block(bfin_core *c)
 
     if (c->stop_flags || b->pc != c->pc || !b->n || b->gen != c->code_gen ||
         c->cycles + b->n > c->run_limit || loop_inside(c, b) ||
-        bfin_is_bp(c, c->pc)) {
+        bfin_is_split(c, c->pc)) {
         return NULL;
     }
     return b;
@@ -607,7 +608,7 @@ static bfin_block *block_at(bfin_core *c, uint32_t pc)
 
         memcpy(&iw0, code + off, 2);
         len = bfin_insn_len(iw0);
-        if (off + len > BLOCK_BYTES || (off && bfin_is_bp(c, pc + off))) {
+        if (off + len > BLOCK_BYTES || (off && bfin_is_split(c, pc + off))) {
             break;
         }
         if (len > 2) {
@@ -672,7 +673,7 @@ int bfin_end(bfin_core *c, const bfin_insn *i)
     c->pc = npc;
     c->cycles = c->cycles_at + i->idx + 1;
     if (npc == pc && self_jump(i->iw0, i->iw1) && !c->trace &&
-        !bfin_is_bp(c, pc)) {
+        !bfin_is_split(c, pc)) {
         skip_self_jump(c, c->step_end);
     }
 #ifdef BFIN_CHAINS
@@ -753,6 +754,9 @@ bfin_stop bfin_step(bfin_core *c, uint64_t budget, uint64_t *executed)
             break;
         }
         c->bp_skip_pc = 1;
+        if (bfin_is_tp(c, pc)) {
+            bfin_trace_hit(c, pc);
+        }
         /* Watchpoints are tested per instruction: no chains, so the core
          * stops right after the access. */
         bfin_block *blk = c->trace || c->nwp ? NULL : block_at(c, pc);
@@ -812,6 +816,9 @@ bfin_stop bfin_stepi(bfin_core *c)
     }
     if (c->idle) {
         return BFIN_STOP_IDLE;
+    }
+    if (bfin_is_tp(c, c->pc)) {
+        bfin_trace_hit(c, c->pc);
     }
     if (run_insn(c, c->pc)) {
         return BFIN_STOP_UNDEF;
@@ -927,6 +934,102 @@ void bfin_set_break(bfin_core *c, uint32_t pc)
     if (pc) {
         bfin_break_add(c, pc);
     }
+}
+
+int bfin_tp_find(const bfin_core *c, uint32_t pc)
+{
+    for (int n = 0; n < c->ntp; n++) {
+        if (c->tp[n] == pc) {
+            return n;
+        }
+    }
+    return -1;
+}
+
+static void tp_rebloom(bfin_core *c)
+{
+    c->tp_bloom = 0;
+    for (int n = 0; n < c->ntp; n++) {
+        c->tp_bloom |= 1ull << ((c->tp[n] >> 1) & 63);
+    }
+}
+
+int bfin_trace_ring(bfin_core *c, uint32_t nrec)
+{
+    if (c->tring || !nrec) {
+        return -1;
+    }
+    c->tring_cap = nrec;
+    return 0;
+}
+
+int bfin_trace_add(bfin_core *c, uint32_t pc, uint16_t id)
+{
+    int n = bfin_tp_find(c, pc);
+
+    if (pc & 1) {
+        return -1;
+    }
+    if (n >= 0) {
+        c->tp_id[n] = id;
+        return 0;
+    }
+    if (c->ntp == BFIN_MAX_TRACE) {
+        return -1;
+    }
+    if (!c->tring) {
+        if (!c->tring_cap) {
+            c->tring_cap = BFIN_TRACE_RING;
+        }
+        c->tring = calloc(c->tring_cap, sizeof(*c->tring));
+        if (!c->tring) {
+            return -1;
+        }
+    }
+    c->tp[c->ntp] = pc;
+    c->tp_id[c->ntp++] = id;
+    tp_rebloom(c);
+    /* Blocks decoded so far run through the new tracepoint. */
+    memset(c->blocks, 0, BLOCK_SLOTS * sizeof(*c->blocks));
+    return 0;
+}
+
+void bfin_trace_clear(bfin_core *c)
+{
+    c->ntp = 0;                     /* undrained records stay readable */
+    tp_rebloom(c);
+}
+
+void bfin_trace_hit(bfin_core *c, uint32_t pc)
+{
+    bfin_trace_rec *r;
+
+    if (c->tring_head - c->tring_tail == c->tring_cap) {
+        c->tring_lost++;
+        return;
+    }
+    r = &c->tring[c->tring_head++ % c->tring_cap];
+    r->cycles = c->cycles;
+    r->pc = pc;
+    r->r0 = c->r[0];
+    r->r1 = c->r[1];
+    r->r2 = c->r[2];
+    r->id = c->tp_id[bfin_tp_find(c, pc)];
+}
+
+size_t bfin_trace_drain(bfin_core *c, bfin_trace_rec *out, size_t max)
+{
+    size_t n = 0;
+
+    while (n < max && c->tring_tail != c->tring_head) {
+        out[n++] = c->tring[c->tring_tail++ % c->tring_cap];
+    }
+    return n;
+}
+
+uint64_t bfin_trace_lost(const bfin_core *c)
+{
+    return c->tring_lost;
 }
 
 int bfin_watch_add(bfin_core *c, uint32_t addr, uint32_t len, int kind)

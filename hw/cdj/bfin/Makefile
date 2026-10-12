@@ -26,11 +26,16 @@ $(O)/byteops_test: tests/byteops_test.c $(OBJS) | $(O)
 $(O)/gdb_test: tests/gdb_test.c tests/gdb_prog.h $(OBJS) | $(O)
 	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
 
+$(O)/trace_test: tests/trace_test.c tests/trace_prog.h $(OBJS) | $(O)
+	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
+
 $(O)/gdb_server: tests/gdb_server.c tests/gdb_prog.h $(OBJS) | $(O)
 	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
 
-check: $(O)/gdb_test $(O)/byteops_test
+check: $(O)/gdb_test $(O)/byteops_test $(O)/trace_test
 	$(O)/gdb_test
+	$(O)/trace_test
+	python3 $(CURDIR)/../../../scripts/debug/bfin_trace_test.py
 	$(O)/byteops_test
 
 # tests/gdb_prog.h is checked in; this regenerates it from gdb_prog.s.
@@ -43,6 +48,17 @@ tests/gdb_prog.h: tests/gdb_prog.s
 	  od -An -v -tx1 $(O)/gdb_prog.bin | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g'; \
 	  echo '};'; \
 	  $(BFIN_BIN)/bfin-elf-nm $(O)/gdb_prog.o | \
+	    awk '$$2 == "T" || $$2 == "t" { printf "#define %s 0x%sU\n", toupper($$3), $$1 }'; \
+	} > $@
+
+tests/trace_prog.h: tests/trace_prog.s | $(O)
+	$(BFIN_BIN)/bfin-elf-as -o $(O)/trace_prog.o $<
+	$(BFIN_BIN)/bfin-elf-objcopy -O binary -j .text $(O)/trace_prog.o $(O)/trace_prog.bin
+	{ echo '/* Generated from trace_prog.s by make tests/trace_prog.h. */'; \
+	  echo 'static const unsigned char trace_prog[] = {'; \
+	  od -An -v -tx1 $(O)/trace_prog.bin | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g'; \
+	  echo '};'; \
+	  $(BFIN_BIN)/bfin-elf-nm $(O)/trace_prog.o | \
 	    awk '$$2 == "T" || $$2 == "t" { printf "#define %s 0x%sU\n", toupper($$3), $$1 }'; \
 	} > $@
 

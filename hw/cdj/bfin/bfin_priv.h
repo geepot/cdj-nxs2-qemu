@@ -145,6 +145,14 @@ struct bfin_core {
     uint32_t watch_addr;
     int      watch_kind;
     unsigned watch_extra;       /* further hits after the first */
+    /* Tracepoints: record and go on. A tracepoint pc always starts a block. */
+    uint32_t tp[BFIN_MAX_TRACE];
+    uint16_t tp_id[BFIN_MAX_TRACE];
+    int      ntp;
+    uint64_t tp_bloom;
+    bfin_trace_rec *tring;
+    uint32_t tring_cap, tring_head, tring_tail;   /* free-running counters */
+    uint64_t tring_lost;
     FILE    *trace;
     uint64_t trace_from, trace_to;
 };
@@ -172,6 +180,21 @@ static inline int bfin_is_bp(const bfin_core *c, uint32_t pc)
 {
     return c->nbp && ((c->bp_bloom >> ((pc >> 1) & 63)) & 1) &&
            bfin_bp_find(c, pc) >= 0;
+}
+
+/* Whether pc holds a tracepoint. */
+int bfin_tp_find(const bfin_core *c, uint32_t pc);
+static inline int bfin_is_tp(const bfin_core *c, uint32_t pc)
+{
+    return c->ntp && ((c->tp_bloom >> ((pc >> 1) & 63)) & 1) &&
+           bfin_tp_find(c, pc) >= 0;
+}
+void bfin_trace_hit(bfin_core *c, uint32_t pc);
+
+/* Blocks end before, and chains stop at, a breakpoint or a tracepoint. */
+static inline int bfin_is_split(const bfin_core *c, uint32_t pc)
+{
+    return bfin_is_bp(c, pc) || bfin_is_tp(c, pc);
 }
 
 /* Records a watchpoint hit; the step loop stops after the instruction. */
