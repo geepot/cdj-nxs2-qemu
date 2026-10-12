@@ -58,6 +58,7 @@ void   bf531_load(bf531 *s, const uint8_t *buf);
 
 bfin_core *bf531_core(bf531 *s);
 uint64_t   bf531_frames(const bf531 *s);
+uint8_t *bf531_mem(bf531 *s, uint32_t addr, size_t len);
 const uint8_t *bf531_sdram(const bf531 *s, uint32_t *size);
 
 #endif

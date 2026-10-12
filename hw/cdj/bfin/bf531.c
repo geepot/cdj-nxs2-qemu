@@ -896,6 +896,12 @@ void bf531_load(bf531 *s, const uint8_t *buf)
     bfin_snap_load(s->core, buf + s->sdram_size);
 }
 
+/* Host view of len bytes of the chip's memory at addr (SDRAM or L1), or NULL. */
+uint8_t *bf531_mem(bf531 *s, uint32_t addr, size_t len)
+{
+    return load_target(s, addr, len);
+}
+
 const uint8_t *bf531_sdram(const bf531 *s, uint32_t *size)
 {
     *size = s->sdram_size;

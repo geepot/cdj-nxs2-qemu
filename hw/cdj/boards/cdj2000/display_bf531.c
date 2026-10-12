@@ -120,7 +120,32 @@ static void cdj_bf531_report(Notifier *n, void *opaque)
 {
     CdjBf531 *s = container_of(n, CdjBf531, exit);
 
+    static const struct { const char *name; uint32_t addr, len; } banks[] = {
+        { "l1a.bin", 0xFF800000, 0x8000 }, { "l1b.bin", 0xFF900000, 0x8000 },
+        { "l1s.bin", 0xFFB00000, 0x1000 },
+    };
+    const char *dir = getenv("CDJ_BF531_DUMP");
+
     info_report("cdj_bf531: %" PRIu64 " PPI frames rendered", s->frames);
+    /* CDJ_BF531_DUMP=<dir>: the GUI's memory at exit, for offline decoding. */
+    if (dir && s->chip) {
+        uint32_t size;
+        const uint8_t *sdram = bf531_sdram(s->chip, &size);
+        g_autofree char *p = g_build_filename(dir, "sdram.bin", NULL);
+
+        if (!g_file_set_contents(p, (const char *)sdram, size, NULL)) {
+            error_report("cdj_bf531: cannot write %s", p);
+        }
+        for (unsigned i = 0; i < ARRAY_SIZE(banks); i++) {
+            g_autofree char *q = g_build_filename(dir, banks[i].name, NULL);
+            const uint8_t *m = bf531_mem(s->chip, banks[i].addr, banks[i].len);
+
+            if (!m || !g_file_set_contents(q, (const char *)m, banks[i].len, NULL)) {
+                error_report("cdj_bf531: cannot write %s", q);
+            }
+        }
+        info_report("cdj_bf531: memory dumped to %s", dir);
+    }
 }
 
 /* The chip runs only inside the tick, on the main loop, so between two ticks
