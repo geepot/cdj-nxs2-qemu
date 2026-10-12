@@ -400,17 +400,25 @@ static void dma_unit_done(bf531 *s, int ch)
  * set here too. */
 static void sport1_rx_complete(bf531 *s, int ch)
 {
+    /* re:spin: SPORT1 RX is a byte stream. The standing bytes go in at
+     * CURR_ADDR and count CURR_X_COUNT down; the descriptor completes (and
+     * interrupts) only once it is full, so a short burst leaves the DMA
+     * running with the count the firmware polls. Bytes beyond the
+     * descriptor stay standing for the next arm. */
     bf531_dma *d = &s->dma[ch];
-    size_t want = (d->reg[D_XCOUNT / 4] & 0xFFFF) * 2;
-    size_t len = s->sport1_rx_len < want ? s->sport1_rx_len : want;
-    uint8_t *to = load_target(s, d->reg[D_START / 4], len);
+    size_t room = (d->reg[D_CURR_X / 4] & 0xFFFF) * 2;
+    size_t len = s->sport1_rx_len < room ? s->sport1_rx_len : room;
+    uint8_t *to = load_target(s, d->reg[D_CURR_ADDR / 4], len);
 
+    d->due = NEVER;
     if (to) {
         memcpy(to, s->sport1_rx, len);
     }
-    s->sport1_rx_len = 0;
-    s->sport1_rx_armed = false;
-    if (s->sport1_q_count) {
+    d->reg[D_CURR_ADDR / 4] += len;
+    d->reg[D_CURR_X / 4] = (room - len) / 2;
+    memmove(s->sport1_rx, s->sport1_rx + len, s->sport1_rx_len - len);
+    s->sport1_rx_len -= len;
+    if (!s->sport1_rx_len && s->sport1_q_count) {
         unsigned h = s->sport1_q_head;
 
         memcpy(s->sport1_rx, s->sport1_q[h], s->sport1_q_len[h]);
@@ -418,6 +426,13 @@ static void sport1_rx_complete(bf531 *s, int ch)
         s->sport1_q_head = (h + 1) % 16;
         s->sport1_q_count--;
     }
+    if (room > len) {
+        if (s->sport1_rx_len) {
+            d->due = bfin_cycles(s->core);
+        }
+        return;
+    }
+    s->sport1_rx_armed = false;
     s->mmr[SIC_IMASK / 4] |= 1u << (IRQ_PPI_DMA + ch);
     dma_unit_done(s, ch);
 }
@@ -478,6 +493,8 @@ static void dma_write(bf531 *s, uint32_t off, uint32_t v)
         slog(s, "DMA%u enabled, config 0x%04x, start 0x%08x, %u words", ch, v,
              d->reg[D_START / 4], d->reg[D_XCOUNT / 4] & 0xFFFF);
         if (ch == 3) {
+            d->reg[D_CURR_ADDR / 4] = d->reg[D_START / 4];
+            d->reg[D_CURR_X / 4] = d->reg[D_XCOUNT / 4] & 0xFFFF;
             s->sport1_rx_armed = true;
             if (s->sport1_rx_len) {
                 sport1_rx_complete(s, ch);
