@@ -20,6 +20,7 @@ enum { EV_EMU, EV_RST, EV_NMI, EV_EVX, EV_GLOBAL, EV_IVHW, EV_IVTMR };
 
 #define BFIN_MAX_RAM 8
 
+
 /* Executes one instruction; the handler of its first word does it all. The
  * handlers of 16-bit instructions ignore iw1. */
 typedef void bfin_op(bfin_core *c, uint16_t iw0, uint16_t iw1);
@@ -133,7 +134,17 @@ struct bfin_core {
 
     uint32_t trap_pc;
     uint64_t trap_insn;
-    uint32_t break_pc;
+    /* Debugger state: host-side only, not part of the snapshot. */
+    uint32_t bp[BFIN_MAX_BREAK];
+    int      nbp;
+    uint64_t bp_bloom;          /* bit (pc >> 1) & 63 per breakpoint */
+    uint32_t bp_skip_pc;        /* resuming from a stop here runs the insn */
+    struct { uint32_t addr, len; int kind; } wp[BFIN_MAX_WATCH];
+    int      nwp;
+    int      watch_pending;     /* a watchpoint hit during this step */
+    uint32_t watch_addr;
+    int      watch_kind;
+    unsigned watch_extra;       /* further hits after the first */
     FILE    *trace;
     uint64_t trace_from, trace_to;
 };
@@ -155,7 +166,19 @@ static inline const bfin_ram *bfin_bank(bfin_core *c, uint32_t addr,
 uint32_t bfin_mmr_read(bfin_core *c, uint32_t addr);
 void     bfin_mmr_write(bfin_core *c, uint32_t addr, uint32_t val);
 
-static inline uint32_t bfin_load(bfin_core *c, uint32_t addr, unsigned size)
+/* Whether pc holds a breakpoint. Costs one test with none set. */
+int bfin_bp_find(const bfin_core *c, uint32_t pc);
+static inline int bfin_is_bp(const bfin_core *c, uint32_t pc)
+{
+    return c->nbp && ((c->bp_bloom >> ((pc >> 1) & 63)) & 1) &&
+           bfin_bp_find(c, pc) >= 0;
+}
+
+/* Records a watchpoint hit; the step loop stops after the instruction. */
+void bfin_watch_check(bfin_core *c, uint32_t addr, unsigned size, int kind);
+
+/* A load that is not the program's: instruction fetch, never a watch hit. */
+static inline uint32_t bfin_load_nw(bfin_core *c, uint32_t addr, unsigned size)
 {
     const bfin_ram *r = bfin_bank(c, addr, size);
     uint32_t v = 0;
@@ -170,13 +193,25 @@ static inline uint32_t bfin_load(bfin_core *c, uint32_t addr, unsigned size)
     return c->bus.read(c->bus.opaque, addr, size);
 }
 
+static inline uint32_t bfin_load(bfin_core *c, uint32_t addr, unsigned size)
+{
+    if (__builtin_expect(c->nwp != 0, 0)) {
+        bfin_watch_check(c, addr, size, BFIN_WATCH_READ);
+    }
+    return bfin_load_nw(c, addr, size);
+}
+
 #define CODE_LINE(addr) (((addr) >> 8) & 0xFFFFF)
 
 static inline void bfin_store(bfin_core *c, uint32_t addr, uint32_t val,
                               unsigned size)
 {
-    const bfin_ram *r = bfin_bank(c, addr, size);
+    const bfin_ram *r;
 
+    if (__builtin_expect(c->nwp != 0, 0)) {
+        bfin_watch_check(c, addr, size, BFIN_WATCH_WRITE);
+    }
+    r = bfin_bank(c, addr, size);
     if (r && !r->rom) {
         memcpy(r->host + (addr - r->base), &val, size);
         if (c->code_lines[CODE_LINE(addr)] |
@@ -211,7 +246,7 @@ static inline uint16_t bfin_fetch16(bfin_core *c, uint32_t addr)
     uint16_t v;
 
     if (!h) {
-        return bfin_load(c, addr, 2);
+        return bfin_load_nw(c, addr, 2);
     }
     memcpy(&v, h, 2);
     return v;
@@ -223,7 +258,7 @@ static inline int bfin_user_mode(const bfin_core *c)
 }
 
 uint32_t bfin_reg(bfin_core *c, unsigned grp, unsigned reg);
-void     bfin_set_reg(bfin_core *c, unsigned grp, unsigned reg, uint32_t v);
+void     bfin_reg_put(bfin_core *c, unsigned grp, unsigned reg, uint32_t v);
 uint32_t bfin_astat(const bfin_core *c);
 void     bfin_set_astat(bfin_core *c, uint32_t v);
 

@@ -5,7 +5,7 @@ CC     ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra -Wno-unused-parameter
 CFLAGS += -std=gnu11 -I.
 
-CORE   = bfin_core.c bfin_exec.c bfin_dsp.c bf531.c
+CORE   = bfin_core.c bfin_exec.c bfin_dsp.c bf531.c bfin_gdb.c
 OBJS   = $(patsubst %.c,$(O)/%.o,$(CORE))
 HDRS   = $(wildcard *.h)
 
@@ -23,8 +23,25 @@ $(O)/bfinrun: bfinrun.c $(OBJS) | $(O)
 $(O)/byteops_test: tests/byteops_test.c $(OBJS) | $(O)
 	$(CC) $(CFLAGS) $^ -o $@
 
-check: $(O)/byteops_test
+$(O)/gdb_test: tests/gdb_test.c tests/gdb_prog.h $(OBJS) | $(O)
+	$(CC) $(CFLAGS) -Itests $< $(OBJS) -o $@
+
+check: $(O)/gdb_test $(O)/byteops_test
+	$(O)/gdb_test
 	$(O)/byteops_test
+
+# tests/gdb_prog.h is checked in; this regenerates it from gdb_prog.s.
+BFIN_BIN ?= $(HOME)/.local/share/cdj-toolchain/binutils-bfin/bin
+tests/gdb_prog.h: tests/gdb_prog.s
+	$(BFIN_BIN)/bfin-elf-as -o $(O)/gdb_prog.o $< 
+	$(BFIN_BIN)/bfin-elf-objcopy -O binary -j .text $(O)/gdb_prog.o $(O)/gdb_prog.bin
+	{ echo '/* Generated from gdb_prog.s by make tests/gdb_prog.h. */'; \
+	  echo 'static const unsigned char gdb_prog[] = {'; \
+	  od -An -v -tx1 $(O)/gdb_prog.bin | sed 's/ \([0-9a-f][0-9a-f]\)/0x\1,/g'; \
+	  echo '};'; \
+	  $(BFIN_BIN)/bfin-elf-nm $(O)/gdb_prog.o | \
+	    awk '$$2 == "T" || $$2 == "t" { printf "#define %s 0x%sU\n", toupper($$3), $$1 }'; \
+	} > $@
 
 clean:
 	rm -rf $(O)

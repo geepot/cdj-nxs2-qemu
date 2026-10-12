@@ -829,7 +829,8 @@ bfin_stop bf531_run(bf531 *s, uint64_t n)
 
         /* At least one cycle: an expired core timer is serviced by the step. */
         stop = bfin_step(s->core, stop_at > now ? stop_at - now : 1, NULL);
-        if (stop == BFIN_STOP_UNDEF || stop == BFIN_STOP_BREAK) {
+        if (stop == BFIN_STOP_UNDEF || stop == BFIN_STOP_BREAK ||
+            stop == BFIN_STOP_WATCH) {
             return stop;
         }
         if (stop == BFIN_STOP_IDLE) {
@@ -843,6 +844,23 @@ bfin_stop bf531_run(bf531 *s, uint64_t n)
         advance(s);
     }
     return BFIN_STOP_BUDGET;
+}
+
+/* One instruction or bundle, then the peripherals catch up with the cycles
+ * it took. An IDLE that nothing wakes just moves time to the next event. */
+bfin_stop bf531_stepi(bf531 *s)
+{
+    bfin_stop stop = bfin_stepi(s->core);
+
+    if (stop == BFIN_STOP_IDLE) {
+        uint64_t due = next_event(s), now = bfin_cycles(s->core);
+
+        if (due != NEVER && due > now) {
+            bfin_skip_cycles(s->core, due - now);
+        }
+    }
+    advance(s);
+    return stop;
 }
 
 bfin_core *bf531_core(bf531 *s)
@@ -906,4 +924,43 @@ const uint8_t *bf531_sdram(const bf531 *s, uint32_t *size)
 {
     *size = s->sdram_size;
     return s->sdram;
+}
+
+/* Reads without side effects for a debugger: RAM, the boot flash, core MMRs
+ * and the SoC's registers (whose reads only log). Returns 0, or -1 for an
+ * address nothing answers at. */
+int bf531_peek(bf531 *s, uint32_t addr, uint8_t *buf, size_t len)
+{
+    for (size_t n = 0; n < len; n++, addr++) {
+        uint8_t *h = load_target(s, addr, 1);
+        uint32_t w;
+
+        if (!h && addr - ASYNC_BASE < FLASH_SIZE) {
+            h = s->flash + (addr - ASYNC_BASE);
+        }
+        if (h) {
+            buf[n] = *h;
+        } else if (addr >= 0xFFE00000) {
+            w = bfin_get_mmr(s->core, addr & ~3u);
+            buf[n] = w >> (8 * (addr & 3));
+        } else if (addr - SYS_BASE < SYS_SIZE) {
+            w = sys_read(s, (addr - SYS_BASE) & ~3u);
+            buf[n] = w >> (8 * (addr & 3));
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Writes RAM only (no register has a side effect from a debugger). */
+int bf531_poke(bf531 *s, uint32_t addr, const uint8_t *buf, size_t len)
+{
+    uint8_t *h = load_target(s, addr, len);
+
+    if (!h) {
+        return -1;
+    }
+    memcpy(h, buf, len);
+    return 0;
 }

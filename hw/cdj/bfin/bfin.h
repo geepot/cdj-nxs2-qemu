@@ -31,8 +31,16 @@ typedef enum bfin_stop {
     BFIN_STOP_IDLE,         /* in IDLE with nothing to wake it               */
     BFIN_STOP_UNDEF,        /* no implementation for the instruction at
                                bfin_trap_pc(); bfin_trap_insn() has its bits */
-    BFIN_STOP_BREAK,        /* reached the address given to bfin_set_break */
+    BFIN_STOP_BREAK,        /* reached a breakpoint address */
+    BFIN_STOP_WATCH,        /* a watchpoint hit; see bfin_watch_hit() */
+    BFIN_STOP_STEP,         /* bfin_stepi finished its instruction */
 } bfin_stop;
+
+#define BFIN_MAX_BREAK 32
+#define BFIN_MAX_WATCH 16
+
+/* Watchpoint kinds are a mask: an access watchpoint is READ | WRITE. */
+enum { BFIN_WATCH_WRITE = 1, BFIN_WATCH_READ = 2, BFIN_WATCH_ACCESS = 3 };
 
 bfin_core *bfin_new(const bfin_bus *bus);
 void       bfin_free(bfin_core *c);
@@ -91,8 +99,42 @@ void   bfin_snap_load(bfin_core *c, const uint8_t *buf);
  * in [from, to). NULL stops it. */
 void bfin_set_trace(bfin_core *c, FILE *f, uint64_t from, uint64_t to);
 
-/* Stop before executing the instruction at pc (0 clears). */
+/* Replaces every breakpoint by one at pc (0 clears them all). */
 void bfin_set_break(bfin_core *c, uint32_t pc);
+
+/* Breakpoints: bfin_step stops with BFIN_STOP_BREAK before executing the
+ * instruction at pc. Resuming from that stop executes it. Adding one that is
+ * set is a no-op. Return 0, or -1: table full (BFIN_MAX_BREAK), odd address,
+ * or (del) not set. */
+int  bfin_break_add(bfin_core *c, uint32_t pc);
+int  bfin_break_del(bfin_core *c, uint32_t pc);
+void bfin_break_clear(bfin_core *c);
+
+/* Watchpoints on the core's own loads and stores (not instruction fetch, not
+ * DMA). kind is BFIN_WATCH_*. A hit stops bfin_step right after the
+ * accessing instruction or bundle with BFIN_STOP_WATCH. Return 0, or -1:
+ * table full (BFIN_MAX_WATCH), len 0, or (del) not set. */
+int  bfin_watch_add(bfin_core *c, uint32_t addr, uint32_t len, int kind);
+int  bfin_watch_del(bfin_core *c, uint32_t addr, uint32_t len, int kind);
+void bfin_watch_clear(bfin_core *c);
+/* After BFIN_STOP_WATCH: the first watchpoint hit (its address and kind as
+ * added); returns 1, or 0 when there was none. bfin_watch_extra() is how
+ * many further hits the same instruction or bundle made. */
+int      bfin_watch_hit(const bfin_core *c, uint32_t *addr, int *kind);
+unsigned bfin_watch_extra(const bfin_core *c);
+
+/* Executes exactly one instruction or bundle, then returns BFIN_STOP_STEP
+ * (or WATCH, UNDEF). A pending event is taken instead if one is ready: the
+ * step ends at the handler's first instruction, before it runs. In IDLE it
+ * returns BFIN_STOP_IDLE without advancing. Breakpoints are not tested at
+ * the starting pc. */
+bfin_stop bfin_stepi(bfin_core *c);
+
+/* Writes a register by the same group/number pair as bfin_get_reg. Returns
+ * 0, or -1 for a pair that does not exist. */
+int  bfin_set_reg(bfin_core *c, unsigned grp, unsigned reg, uint32_t val);
+/* Moves the PC; the instruction there runs even if a breakpoint is set. */
+void bfin_set_pc(bfin_core *c, uint32_t pc);
 
 /* Instruction length at the given first word, as the sequencer decodes it:
  * 2, 4 or 8 bytes. */

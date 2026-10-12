@@ -56,6 +56,13 @@ bfin_stop bf531_run(bf531 *s, uint64_t n);
 size_t bf531_save(const bf531 *s, uint8_t *buf);
 void   bf531_load(bf531 *s, const uint8_t *buf);
 
+/* Like bf531_run for exactly one instruction or bundle (bfin_stepi). */
+bfin_stop bf531_stepi(bf531 *s);
+/* Debugger memory access: 0, or -1 when part of the range is not mapped (peek)
+ * or not RAM (poke). Peeking has no side effect on the chip. */
+int bf531_peek(bf531 *s, uint32_t addr, uint8_t *buf, size_t len);
+int bf531_poke(bf531 *s, uint32_t addr, const uint8_t *buf, size_t len);
+
 bfin_core *bf531_core(bf531 *s);
 uint64_t   bf531_frames(const bf531 *s);
 uint8_t *bf531_mem(bf531 *s, uint32_t addr, size_t len);
