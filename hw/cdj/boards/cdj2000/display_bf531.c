@@ -24,7 +24,12 @@
 /* One PPI/DMA0 unit's worth of the display processor's own 400 MHz clock
  * (see bf531.c's dma_start_unit): stepping this much a QEMU timer tick
  * keeps its own frame rate without syncing it to MAIN's icount. */
-#define CDJ_BF531_QUANTUM (BF531_CCLK_HZ / 60)
+#define CDJ_BF531_QUANTUM (BF531_CCLK_HZ / cdj_bf531_tick_hz)
+
+/* CDJ_BF531_TICK_HZ: ticks per virtual second (default 60). A link that
+ * answers frame by frame pays one or two ticks per round trip, so it needs a
+ * finer quantum than the stock firmware's lockstep. */
+static unsigned cdj_bf531_tick_hz = 60;
 
 typedef struct CdjBf531 {
     bf531 *chip;
@@ -108,7 +113,7 @@ static void cdj_bf531_tick(void *opaque)
         return;
     }
     timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / 60);
+              NANOSECONDS_PER_SECOND / cdj_bf531_tick_hz);
 }
 
 static void cdj_bf531_report(Notifier *n, void *opaque)
@@ -276,6 +281,7 @@ bool cdj2000_display_init(const Cdj2000Display *desc)
     bf531_host host = { s, cdj_bf531_frame, cdj_bf531_answer };
     const char *img_path = getenv("CDJ_BF531_UPD");
     const char *sport1 = getenv("CDJ_BF531_SPORT1");
+    const char *tick_hz = getenv("CDJ_BF531_TICK_HZ");
     uint8_t *img;
     gsize len;
 
@@ -285,6 +291,15 @@ bool cdj2000_display_init(const Cdj2000Display *desc)
     }
     if (!img_path) {
         return false;
+    }
+    if (tick_hz) {
+        unsigned hz = strtoul(tick_hz, NULL, 10);
+
+        if (hz < 60 || hz > 100000) {
+            error_report("cdj_bf531: CDJ_BF531_TICK_HZ=%s out of 60..100000", tick_hz);
+            exit(1);
+        }
+        cdj_bf531_tick_hz = hz;
     }
     if (!g_file_get_contents(img_path, (gchar **)&img, &len, NULL)) {
         error_report("cdj_bf531: cannot read '%s'", img_path);
