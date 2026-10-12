@@ -453,7 +453,11 @@ static void cdj_bf531_tick(void *opaque)
         timer_mod(s->tick, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   NANOSECONDS_PER_SECOND / cdj_bf531_tick_hz);
         bfin_gdb_stopped(s->gdb, stop);
-        vm_stop(RUN_STATE_DEBUG);
+        /* Not vm_stop(): it disables the virtual clock and waits for its
+         * timers, this callback among them. The main loop stops the machine
+         * right after; until then the tick sees the halt and runs nothing. */
+        qemu_system_vmstop_request_prepare();
+        qemu_system_vmstop_request(RUN_STATE_DEBUG);
         if (s->gdb_lost) {
             cdj_bf531_gdb_drop(s);
         }
